@@ -1,19 +1,21 @@
 #include "DigitalCaliper.h"
 #include <soc/gpio_struct.h>   // GPIO.in — atomic register read
 
-// ── Static member definitions ─────────────────────────────────────────────────
-DigitalCaliper* DigitalCaliper::s_instance   = nullptr;
+// ── Static registry ───────────────────────────────────────────────────────────
+DigitalCaliper* DigitalCaliper::s_instances[DigitalCaliper::MAX_INSTANCES] = {};
 
-volatile int64_t  DigitalCaliper::s_rise_us    = 0;
-volatile int64_t  DigitalCaliper::s_fall_us    = 0;
+void (*const DigitalCaliper::s_isrs[DigitalCaliper::MAX_INSTANCES])() = {
+    DigitalCaliper::isr_slot_0,
+    DigitalCaliper::isr_slot_1,
+    DigitalCaliper::isr_slot_2,
+    DigitalCaliper::isr_slot_3,
+};
 
-volatile uint32_t DigitalCaliper::s_accumulator = 0;
-volatile uint8_t  DigitalCaliper::s_bit_idx     = 0;
-
-volatile int32_t  DigitalCaliper::s_raw_value    = 0;
-volatile uint8_t  DigitalCaliper::s_raw_unit     = 0;
-volatile bool     DigitalCaliper::s_ready        = false;
-volatile uint32_t DigitalCaliper::s_packet_count = 0;
+// ── ISR trampolines ───────────────────────────────────────────────────────────
+void IRAM_ATTR DigitalCaliper::isr_slot_0() { if (s_instances[0]) s_instances[0]->isr_handler(); }
+void IRAM_ATTR DigitalCaliper::isr_slot_1() { if (s_instances[1]) s_instances[1]->isr_handler(); }
+void IRAM_ATTR DigitalCaliper::isr_slot_2() { if (s_instances[2]) s_instances[2]->isr_handler(); }
+void IRAM_ATTR DigitalCaliper::isr_slot_3() { if (s_instances[3]) s_instances[3]->isr_handler(); }
 
 // ── Sync threshold ────────────────────────────────────────────────────────────
 // The NPN level-shifter INVERTS both CLK and DATA signals.
@@ -33,61 +35,73 @@ static constexpr int64_t SYNC_LOW_THRESHOLD_US = 20000; // 20 ms
 
 DigitalCaliper::DigitalCaliper(uint8_t clk_pin, uint8_t data_pin)
     : m_clk_pin(clk_pin), m_data_pin(data_pin)
-{
-    s_instance = this;
+{}
+
+DigitalCaliper::~DigitalCaliper() {
+    if (m_slot < MAX_INSTANCES) {
+        detachInterrupt(digitalPinToInterrupt(m_clk_pin));
+        s_instances[m_slot] = nullptr;
+        m_slot = 0xFF;
+    }
 }
 
 void DigitalCaliper::begin() {
+    // Find a free slot.
+    for (uint8_t i = 0; i < MAX_INSTANCES; ++i) {
+        if (s_instances[i] == nullptr) {
+            m_slot = i;
+            s_instances[i] = this;
+            break;
+        }
+    }
+    if (m_slot == 0xFF) return;  // no free slot — silently bail
+
     pinMode(m_clk_pin,  INPUT);
     pinMode(m_data_pin, INPUT);
-    attachInterrupt(digitalPinToInterrupt(m_clk_pin), isr_change, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(m_clk_pin), s_isrs[m_slot], CHANGE);
 }
 
-// ── CHANGE ISR ────────────────────────────────────────────────────────────────
+// ── Per-instance CHANGE ISR ───────────────────────────────────────────────────
 // The NPN level-shifter inverts CLK:
 //   Caliper CLK HIGH (idle/inter-packet) → ESP CLK LOW
 //   Caliper CLK FALLING                  → ESP CLK RISING
 //   Caliper CLK RISING (data valid)      → ESP CLK FALLING
 //
 // RISING edge of ESP CLK = caliper CLK FALLING.
-//   DATA is in transition here — do not sample.
-//   Measure the preceding LOW duration (s_fall_us → now).
+//   DATA is in transition — do not sample.
+//   Measure the preceding LOW duration (m_fall_us → now).
 //   A long LOW = inter-packet gap → reset accumulator for fresh packet.
 //
 // FALLING edge of ESP CLK = caliper CLK RISING = DATA IS STABLE.
 //   Sample DATA and accumulate 24 bits; publish on the 24th.
-//     acc bits  0-15 → protocol bits  0-15 (magnitude, 0.01 mm)
-//     acc bit   20   → protocol bit   20   (sign:  0=positive, 1=negative)
-//     acc bit   23   → protocol bit   23   (unit:  0=mm,       1=inch)
-void IRAM_ATTR DigitalCaliper::isr_change() {
+void IRAM_ATTR DigitalCaliper::isr_handler() {
     const int64_t  now     = esp_timer_get_time();
     const uint32_t gpio_in = GPIO.in;
-    const uint8_t  clk     = (gpio_in >> s_instance->m_clk_pin) & 1;
+    const uint8_t  clk     = (gpio_in >> m_clk_pin) & 1;
 
     if (clk) {
         // ── Rising edge = caliper CLK FALLING ────────────────────────────────
         // DATA is in transition — do not sample.
-        const int64_t low_us = now - s_fall_us;
-        s_rise_us = now;
+        const int64_t low_us = now - m_fall_us;
+        m_rise_us = now;
         if (low_us > SYNC_LOW_THRESHOLD_US) {
-            // Inter-packet gap just ended — reset for fresh packet.
-            s_accumulator = 0;
-            s_bit_idx     = 0;
+            accumulator = 0;
+            bit_idx     = 0;
         }
 
     } else {
         // ── Falling edge = caliper CLK RISING = DATA STABLE ──────────────────
-        s_fall_us = now;
+        m_fall_us = now;
 
-        if (s_bit_idx >= 24) return;  // guard against spurious extra edges
+        if (bit_idx >= 24) return;  // guard against spurious extra edges
 
-        const uint8_t data = (gpio_in >> s_instance->m_data_pin) & 1;
+        const uint8_t data = (gpio_in >> m_data_pin) & 1;
         if (data == 0) {
             // Active-low (inverted): ESP DATA LOW → caliper DATA HIGH → bit = 1.
-            s_accumulator |= (1UL << s_bit_idx);
+            accumulator |= (1UL << bit_idx);
         }
-        if (++s_bit_idx == 24) {
-            publish(s_accumulator);
+        if (++bit_idx == 24) {
+            publish(accumulator);
         }
     }
 }
@@ -102,19 +116,19 @@ void DigitalCaliper::publish(uint32_t acc) {
         ? -(int32_t)magnitude
         :  (int32_t)magnitude;
 
-    s_raw_value    = signed_val;
-    s_raw_unit     = unit;
-    s_packet_count = s_packet_count + 1;  // diagnostic
-    s_ready        = true;                // publish last
+    m_raw_value  = signed_val;
+    m_raw_unit   = unit;
+    packet_count = packet_count + 1;  // diagnostic
+    m_ready      = true;              // publish last
 }
 
 // ── read() — call from loop() ─────────────────────────────────────────────────
 bool DigitalCaliper::read(CaliperReading& out) {
-    if (!s_ready) return false;
-    s_ready = false;   // consume before copying so no double-read
+    if (!m_ready) return false;
+    m_ready = false;   // consume before copying so no double-read
 
-    const int32_t  v    = s_raw_value;
-    const uint8_t  u    = s_raw_unit;
+    const int32_t  v    = m_raw_value;
+    const uint8_t  u    = m_raw_unit;
     const bool     neg  = (v < 0);
     const int32_t  absv = neg ? -v : v;
     const CaliperUnit unit = (u == 1) ? CaliperUnit::INCH : CaliperUnit::MM;
