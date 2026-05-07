@@ -234,5 +234,5 @@ Full protocol documentation: <https://makingstuff.info/Projects/Digital_Calipers
 ---
 
 ## License
-
+Apache 2.0 — see [LICENSE](LICENSE).
 MIT
