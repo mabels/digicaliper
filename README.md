@@ -28,23 +28,20 @@ Tested hardware: [Asune 150 mm Digital Caliper (Amazon DE B0CQ549HQD)](https://w
 
 Most cheap calipers expose a USB-mini-style socket that carries the serial
 data — **this is not USB**.  The socket is repurposed as a simple 3-wire
-interface:
+interface carrying GND, DATA, and CLK.
 
-```
-USB-mini socket (caliper side)
+![Caliper connector wiring](docs/caliper-connector.jpg)
 
-  ┌─────────────────────┐
-  │  RT   BR   SW       │
-  │  GND DATA CLK       │
-  └──────────┬──────────┘
-             │ cable to level-shifter board
-```
+> Wire colours vary between manufacturers — check with a multimeter if in
+> doubt.  The photo above shows the connector on the tested unit (Asune 150 mm).
 
-| Wire | Signal | Level         |
-|------|--------|---------------|
-| RT (red)   | GND  | —            |
-| BR (brown) | DATA | 1.5 V logic  |
-| SW (black) | CLK  | 1.5 V logic  |
+The three active pins carry:
+
+| Pin    | Signal | Level        |
+|--------|--------|--------------|
+| 1      | GND    | —            |
+| 3      | DATA   | 1.5 V logic  |
+| 4      | CLK    | 1.5 V logic  |
 
 > **Important — 1.5 V logic!**  The caliper runs from a CR2032 cell.  Its
 > output swings between 0 V and ~1.5 V, which is below the 3.3 V GPIO
@@ -92,11 +89,11 @@ GND ─┴─────────┘              GND ─┴─────�
 
 Signal sense after the level-shifter:
 
-- Caliper CLK **high** → transistor ON → ESP CLK pin **low**  
-- Caliper DATA **high** (bit = 1) → transistor ON → ESP DATA pin **low**  
+- Caliper CLK **high** → transistor ON → ESP CLK pin **low**
+- Caliper DATA **high** (bit = 1) → transistor ON → ESP DATA pin **low**
 - Caliper DATA **low** (bit = 0, also idle state) → transistor OFF → ESP DATA pin **high**
 
-The ISR samples DATA at the inverted CLK edge and interprets a low GPIO
+The ISR samples DATA at the falling CLK edge and interprets a low GPIO
 reading as a `1` bit accordingly.
 
 ---
@@ -107,8 +104,8 @@ reading as a `1` bit accordingly.
 
 **Option A — copy into `src/`**
 
-Copy `DigitalCaliper.h` and `DigitalCaliper.cpp` into your project's `src/`
-folder and add to `platformio.ini`:
+Copy `src/DigitalCaliper.h` and `src/DigitalCaliper.cpp` into your project's
+`src/` folder and add to `platformio.ini`:
 
 ```ini
 build_src_filter = +<*.cpp>
@@ -155,10 +152,12 @@ void loop() {
 }
 ```
 
-`read()` returns `true` and fills `out` only when a fresh packet has
-arrived since the last call.  Call it freely from `loop()` — it is cheap
-and non-blocking.  If no new data is available it returns `false` and leaves
+`read()` returns `true` and fills `out` only when a fresh packet has arrived
+since the last call.  Call it freely from `loop()` — it is cheap and
+non-blocking.  If no new data is available it returns `false` and leaves
 `out` unchanged.
+
+A ready-to-flash example lives in [`examples/serial_log/`](examples/serial_log/).
 
 ---
 
@@ -167,8 +166,8 @@ and non-blocking.  If no new data is available it returns `false` and leaves
 ```cpp
 DigitalCaliper(uint8_t clk_pin, uint8_t data_pin);
 ```
-Construct the driver.  `clk_pin` is the GPIO connected to the CLK wire;
-`data_pin` to the DATA wire (after the level-shifter).
+Construct the driver.  `clk_pin` is the GPIO connected to CLK (after the
+level-shifter); `data_pin` to DATA.
 
 ```cpp
 void begin();
@@ -210,25 +209,25 @@ enum class CaliperUnit : uint8_t { MM = 0, INCH = 1 };
 The caliper generates CLK; the ESP32 only listens.  Each packet is 24 bits,
 LSB-first, at roughly 10 Hz.
 
-| Bits  | Meaning                                        |
-|-------|------------------------------------------------|
-| 0–15  | Unsigned magnitude in 0.01 mm units            |
-| 16–19 | Unused / zero                                  |
-| 20    | Sign flag — 0 = positive, 1 = negative         |
-| 21–22 | Unused / zero                                  |
-| 23    | Unit flag — 0 = mm, 1 = inch                   |
+| Bits  | Meaning                                       |
+|-------|-----------------------------------------------|
+| 0–15  | Unsigned magnitude in 0.01 mm units           |
+| 16–19 | Unused / zero                                 |
+| 20    | Sign flag — 0 = positive, 1 = negative        |
+| 21–22 | Unused / zero                                 |
+| 23    | Unit flag — 0 = mm, 1 = inch                  |
 
-**Sync detection.**  Between packets CLK idles.  The driver measures the
-LOW duration on CLK (time between a falling edge and the next rising edge).
-A gap longer than 1 ms indicates a packet boundary; the accumulator and bit
-counter are reset, and the first rising edge of the new packet is treated as
-bit 0.
+**Sync detection.**  The NPN level-shifter inverts both signals, so the
+inter-packet idle (caliper CLK high) appears as a long LOW on the ESP32 GPIO
+(~50–90 ms).  The driver measures the LOW duration between a falling edge and
+the next rising edge.  A gap longer than 20 ms marks a packet boundary; the
+accumulator and bit counter are reset on the next rising edge, and the
+following 24 falling edges map directly to bits 0–23 with no phantom offset.
 
-**Phantom bit.**  The DATA line idles LOW (active-low = logic 1) during the
-inter-packet gap.  The sync rising edge samples this idle state and would
-always produce a spurious `1` as bit 0.  The driver corrects for this by
-right-shifting the raw 24-bit accumulator by one position before extracting
-the value, sign, and unit fields.
+**Sampling edge.**  Data is valid on the caliper's rising CLK edge, which
+(after inversion) is the *falling* edge on the ESP32 GPIO.  The ISR samples
+DATA on every falling CLK edge and accumulates bits; rising edges are used
+only for inter-packet gap measurement.
 
 Full protocol documentation: <https://makingstuff.info/Projects/Digital_Calipers>
 
