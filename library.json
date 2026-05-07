@@ -1,0 +1,9 @@
+{
+  "name": "digicaliper",
+  "version": "1.0.0",
+  "description": "ISR-driven ESP32 driver for cheap 24-bit Chinese digital calipers",
+  "keywords": ["caliper", "digital caliper", "esp32", "isr"],
+  "build": { "srcDir": "src" },
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
